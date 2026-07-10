@@ -4,12 +4,12 @@ A complete study system for the AVTAA VTS (Anesthesia & Analgesia) certification
 
 ## The study system (designed like real board prep)
 
-**310 board-level questions total**, split into two walled-off pools:
-- **210 practice questions** — the training ground (6 practice exams + topic practice + adaptive review)
+**346 board-level questions total**, split into two walled-off pools:
+- **246 practice questions** — the training ground. The **6 practice exams are now fully distinct** (40 unique questions each, zero overlap between exams). Answer positions still shuffle every attempt so she learns concepts, not positions.
 - **100 reserved mock questions** — never shown in practice, so the mock exams are a true "cold" test
 
 ### 1. Practice Exams (6)
-- 40 questions each, **freshly randomized every attempt** — different questions AND shuffled answer order, so she learns concepts, not positions
+- 40 questions each, **a fixed dedicated set per exam** (no overlap between the 6 exams), with **answer positions shuffled every attempt** so she can't memorize positions
 - Toggle feedback: explanations after each question, or all at the end
 - **Practice readiness** = average of her best score across all 6
 
