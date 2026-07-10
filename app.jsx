@@ -139,12 +139,26 @@ function mergeStores(a, b) {
   merged.mockProgress = mp;
   return merged;
 }
+// Order-independent deep-equal for JSON-safe data, so we only push to the
+// cloud when the merge genuinely added something (not just on key reordering).
+function sameData(a, b) {
+  if (a === b) return true;
+  if (a === null || b === null || typeof a !== "object" || typeof b !== "object") return false;
+  const ka = Object.keys(a), kb = Object.keys(b);
+  if (ka.length !== kb.length) return false;
+  return ka.every(k => sameData(a[k], b[k]));
+}
 async function cloudLoad() {
   const local = localLoad();
   const cloud = await cloudFetch();
   if (cloud === null) return local || {};
   const merged = mergeStores(local, cloud);
   localSave(merged);
+  // Push local-only progress (made while the cloud was offline) straight back
+  // up, so other devices see it immediately — no need to finish a quiz first.
+  // Compare against the cloud normalized to the merged shape so empty-map
+  // defaults alone don't trigger a needless write.
+  if (!sameData(merged, mergeStores(cloud, cloud))) cloudPush(merged);
   return merged;
 }
 
@@ -571,7 +585,12 @@ function App() {
       if (document.visibilityState !== "visible") return;
       cloudFetch().then(cloud => {
         setCloudOk(cloud !== null);
-        if (cloud) setStore(s => { const m = mergeStores(s, cloud); localSave(m); return m; });
+        if (cloud) setStore(s => {
+          const m = mergeStores(s, cloud);
+          localSave(m);
+          if (!sameData(m, mergeStores(cloud, cloud))) cloudPush(m); // upload any progress the cloud is missing
+          return m;
+        });
       });
     };
     document.addEventListener("visibilitychange", refresh);
