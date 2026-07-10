@@ -58,24 +58,94 @@ const supaHeaders = {
   "Prefer": "resolution=merge-duplicates",
 };
 let memStore = {};
-async function cloudSave(data) {
+function localSave(data) {
   try { localStorage.setItem(LOCAL_KEY, JSON.stringify(data)); } catch(_) { memStore = data; }
+}
+function localLoad() {
+  try { const r = localStorage.getItem(LOCAL_KEY); if (r) return JSON.parse(r); } catch(_) {}
+  return memStore || null;
+}
+async function cloudPush(data, keepalive) {
   try {
-    await fetch(`${SUPA_URL}/rest/v1/progress`, {
-      method: "POST", headers: supaHeaders,
+    const res = await fetch(`${SUPA_URL}/rest/v1/progress`, {
+      method: "POST", headers: supaHeaders, keepalive: !!keepalive,
       body: JSON.stringify({ id: SUPA_RECORD_ID, data, updated_at: new Date().toISOString() }),
     });
-    return true;
+    return res.ok;
   } catch(_) { return false; }
 }
-async function cloudLoad() {
+async function cloudSave(data) {
+  localSave(data);
+  return cloudPush(data);
+}
+// Chatty mid-mock saves: local write is immediate (exact same-device resume),
+// the cloud POST is coalesced to at most one every MOCK_PUSH_MS.
+const MOCK_PUSH_MS = 5000;
+let pushTimer = null, lastPushAt = 0, pendingPush = null;
+function cloudSaveThrottled(data) {
+  localSave(data);
+  pendingPush = data;
+  if (pushTimer) return;
+  const wait = Math.max(0, MOCK_PUSH_MS - (Date.now() - lastPushAt));
+  pushTimer = setTimeout(() => {
+    pushTimer = null; lastPushAt = Date.now();
+    const d = pendingPush; pendingPush = null;
+    cloudPush(d);
+  }, wait);
+}
+// Flush a queued push when the tab/app backgrounds or closes (keepalive
+// lets the request outlive the page).
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden" && pendingPush) {
+    clearTimeout(pushTimer); pushTimer = null; lastPushAt = Date.now();
+    const d = pendingPush; pendingPush = null;
+    cloudPush(d, true);
+  }
+});
+// Cloud only. Returns null when unreachable, {} when reachable but empty —
+// callers must not treat "unreachable" as "no progress".
+let cloudWasReachable = true;
+async function cloudFetch() {
   try {
     const res = await fetch(`${SUPA_URL}/rest/v1/progress?id=eq.${SUPA_RECORD_ID}&select=data`, { headers: supaHeaders });
+    cloudWasReachable = res.ok;
+    if (!res.ok) return null;
     const rows = await res.json();
-    if (rows && rows[0] && rows[0].data) return rows[0].data;
-  } catch(_) {}
-  try { const r = localStorage.getItem(LOCAL_KEY); if (r) return JSON.parse(r); } catch(_) {}
-  return memStore || {};
+    return (rows && rows[0] && rows[0].data) || {};
+  } catch(_) { cloudWasReachable = false; return null; }
+}
+// Field-aware merge so two devices can never wipe each other's progress:
+// best scores and missed counts keep the higher value, in-progress mock
+// state keeps whichever attempt is further along.
+function mergeStores(a, b) {
+  a = a || {}; b = b || {};
+  const maxMap = (x = {}, y = {}) => {
+    const o = { ...x };
+    Object.keys(y).forEach(k => { o[k] = Math.max(o[k] || 0, y[k] || 0); });
+    return o;
+  };
+  const merged = { ...a, ...b };
+  merged.bestExam = maxMap(a.bestExam, b.bestExam);
+  merged.bestTopic = maxMap(a.bestTopic, b.bestTopic);
+  merged.bestMock = maxMap(a.bestMock, b.bestMock);
+  merged.missedCounts = maxMap(a.missedCounts, b.missedCounts);
+  const mp = { ...(a.mockProgress || {}) };
+  Object.entries(b.mockProgress || {}).forEach(([k, v]) => {
+    const cur = mp[k];
+    const answered = p => Object.keys((p && p.answers) || {}).length;
+    if (!cur || answered(v) > answered(cur) ||
+        (answered(v) === answered(cur) && (v.secondsLeft ?? Infinity) < (cur.secondsLeft ?? Infinity))) mp[k] = v;
+  });
+  merged.mockProgress = mp;
+  return merged;
+}
+async function cloudLoad() {
+  const local = localLoad();
+  const cloud = await cloudFetch();
+  if (cloud === null) return local || {};
+  const merged = mergeStores(local, cloud);
+  localSave(merged);
+  return merged;
 }
 
 const T = {
@@ -480,6 +550,7 @@ function App() {
   const [store, setStore] = useState({});
   const [loaded, setLoaded] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  const [cloudOk, setCloudOk] = useState(true);
   const [view, setView] = useState("home");
   const [mode, setMode] = useState(null);
   const [activeQuestions, setActiveQuestions] = useState([]);
@@ -490,9 +561,31 @@ function App() {
   const [lastResult, setLastResult] = useState(null);
   const [wasBest, setWasBest] = useState(false);
 
-  useEffect(() => { cloudLoad().then(d => { setStore(d || {}); setLoaded(true); }); }, []);
+  useEffect(() => { cloudLoad().then(d => { setStore(d || {}); setCloudOk(cloudWasReachable); setLoaded(true); }); }, []);
 
-  const persist = (next) => { setStore(next); setSyncing(true); cloudSave(next).then(() => setSyncing(false)); };
+  // Re-pull cloud progress whenever the app returns to the foreground, so a
+  // suspended iPhone PWA and a laptop tab never overwrite each other with
+  // stale data — merge keeps the best of both.
+  useEffect(() => {
+    const refresh = () => {
+      if (document.visibilityState !== "visible") return;
+      cloudFetch().then(cloud => {
+        setCloudOk(cloud !== null);
+        if (cloud) setStore(s => { const m = mergeStores(s, cloud); localSave(m); return m; });
+      });
+    };
+    document.addEventListener("visibilitychange", refresh);
+    window.addEventListener("focus", refresh);
+    return () => {
+      document.removeEventListener("visibilitychange", refresh);
+      window.removeEventListener("focus", refresh);
+    };
+  }, []);
+
+  const persist = (next) => {
+    setStore(next); setSyncing(true);
+    cloudSave(next).then(ok => { setSyncing(false); setCloudOk(ok); });
+  };
 
   // ── Stored data ──
   const bestExam = store.bestExam || {};       // {1: pct, ...} practice
@@ -590,7 +683,7 @@ function App() {
       },
     };
     setStore(next);
-    cloudSave(next); // silent save, no spinner spam
+    cloudSaveThrottled(next); // silent save — local every tick, cloud at most every few seconds
   };
 
   const onFinish = (result) => {
@@ -656,10 +749,10 @@ function App() {
       {/* Sync badge */}
       <div style={{ position: "fixed", top: "calc(env(safe-area-inset-top) + 10px)", right: 14, zIndex: 50,
         fontSize: 11, fontWeight: 700, padding: "5px 11px", borderRadius: 20,
-        background: syncing ? T.violetSoft : T.greenSoft, color: syncing ? T.violet2 : T.green,
-        border: `1px solid ${syncing ? T.violet : T.green}44`, transition: "all 0.3s", display: "flex", alignItems: "center", gap: 5 }}>
+        background: syncing ? T.violetSoft : cloudOk ? T.greenSoft : T.amberSoft, color: syncing ? T.violet2 : cloudOk ? T.green : T.amber,
+        border: `1px solid ${syncing ? T.violet : cloudOk ? T.green : T.amber}44`, transition: "all 0.3s", display: "flex", alignItems: "center", gap: 5 }}>
         {syncing ? (<><span style={{ display: "inline-block", width: 9, height: 9, border: `2px solid ${T.violet2}`,
-          borderTopColor: "transparent", borderRadius: "50%", animation: "spin 0.7s linear infinite" }} />Saving</>) : (<>☁️ Synced</>)}
+          borderTopColor: "transparent", borderRadius: "50%", animation: "spin 0.7s linear infinite" }} />Saving</>) : cloudOk ? (<>☁️ Synced</>) : (<>⚠️ Offline</>)}
       </div>
 
       {/* Header */}
@@ -805,7 +898,7 @@ function App() {
       <div style={{ textAlign: "center", marginTop: 34, padding: "0 24px" }}>
         <div style={{ fontSize: 11, color: T.muted, lineHeight: 1.6 }}>
           {PRACTICE_POOL.length + MOCK_POOL.length} board-level questions · 6 distinct exams · {MOCK_POOL.length} reserved for mocks.<br />
-          {syncing ? "☁️ Saving to cloud…" : "☁️ Scores sync automatically across your devices."}
+          {syncing ? "☁️ Saving to cloud…" : cloudOk ? "☁️ Scores sync automatically across your devices." : "⚠️ Cloud unreachable — progress is saved on this device and will sync when you're back online."}
         </div>
       </div>
     </div>
